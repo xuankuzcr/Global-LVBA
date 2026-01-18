@@ -297,12 +297,13 @@ void down_sampling_voxel(pcl::PointCloud<PointT> &pl_feat, double voxel_size)
   }
 }
 
-void down_sampling_voxel2(pcl::PointCloud<PointType> &pl_feat, double voxel_size)
+template <typename PointT>
+void down_sampling_voxel2(pcl::PointCloud<PointT> &pl_feat, double voxel_size)
 {
   if (voxel_size < 0.001) return;
 
   struct BestInVoxel {
-    PointType pt;      // keep an original point (no averaging)
+    PointT pt;      // keep an original point (no averaging)
     double best_d2;    // squared distance to voxel center
     bool inited;
     BestInVoxel() : best_d2(std::numeric_limits<double>::infinity()), inited(false) {}
@@ -311,7 +312,7 @@ void down_sampling_voxel2(pcl::PointCloud<PointType> &pl_feat, double voxel_size
   std::unordered_map<VOXEL_LOC, BestInVoxel> feat_map;
   feat_map.reserve(pl_feat.size());
 
-  for (const PointType &p : pl_feat.points)
+  for (const PointT &p : pl_feat.points)
   {
     float loc_x = static_cast<float>(p.x / voxel_size);
     float loc_y = static_cast<float>(p.y / voxel_size);
@@ -345,7 +346,7 @@ void down_sampling_voxel2(pcl::PointCloud<PointType> &pl_feat, double voxel_size
     }
   }
 
-  pcl::PointCloud<PointType> empty;
+  pcl::PointCloud<PointT> empty;
   pl_feat.swap(empty);
   pl_feat.reserve(feat_map.size());
 

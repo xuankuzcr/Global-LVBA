@@ -65,4 +65,4 @@ roslaunch Global-LVBA lvba.launch
 
 ## 5. License
 
-The source code of this package is released under the [MIT](https://opensource.org/license/mit) license.
+The source code of this package is released under the [**MIT**](https://opensource.org/license/mit) license.

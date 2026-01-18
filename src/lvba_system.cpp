@@ -20,6 +20,9 @@ LvbaSystem::LvbaSystem(ros::NodeHandle& nh) : nh_(nh)
     nh_.param<bool>("data_config/enable_visual_ba", enable_visual_ba_, true);
     nh_.param<double>("track_fusion/min_view_angle", min_view_angle_deg_, 8.0);
     nh_.param<double>("track_fusion/reproj_mean_thr", reproj_mean_thr_px_, 3.0);
+
+    nh_.param<bool>("colmap_output/enable", colmap_output_enable_, true);
+    nh_.param<double>("colmap_output/filter_size_points3D", filter_size_points3D_, 0.01);
 }
 
 void LvbaSystem::runFullPipeline() 
@@ -527,7 +530,7 @@ bool LvbaSystem::loadFromColmapDB()
                     continue;
                 }
 
-                // 你的 pair_id 计算已保证 image_id 升序
+                // pair_id 计算已保证 image_id 升序
                 const bool swapped = (id1 > id2);  // 仅用于索引方向校正
                 const uint64_t pair_id = imageIdsToPairId((uint32_t)id1, (uint32_t)id2);
 
@@ -557,7 +560,7 @@ bool LvbaSystem::loadFromColmapDB()
                     int i2 = i_large;
                     if (swapped) std::swap(i1, i2);
 
-                    // 防御性过滤，避免 drawMatches 越界
+                    // 避免 drawMatches 越界
                     if (i1 >= 0 && i1 < (int)kpts1.size() &&
                         i2 >= 0 && i2 < (int)kpts2.size()) {
                         vec.emplace_back(i1, i2);
@@ -570,7 +573,6 @@ bool LvbaSystem::loadFromColmapDB()
 
     sqlite3_close(db);
     std::cout << "[DB] Loaded keypoints & inlier matches from " << dataset_io_->colmap_db_path_ << "\n";
-    // 记录结束时间
     return true;
 }
 
@@ -1267,11 +1269,9 @@ void LvbaSystem::optimizeCameraPoses()
     if (tracks_.empty())
         throw std::runtime_error("optimizeCamPoses: tracks_ is empty. Run BuildTracksAndFuse3D() first.");
 
-    // 只保留 >=2 观测 & 融合点有效 的 tracks
     std::vector<int> track_ids; track_ids.reserve(tracks_.size());
     for (int i = 0; i < (int)tracks_.size(); ++i) {
         const auto& tr = tracks_[i];
-        // [建议] 这里可以稍微提高门槛，比如 obser_thr_ 至少为 3，或者检查 rms
         if (tr.observations.size() >= obser_thr_ && !tr.Xw_fused.isZero(1e-12) && tr.Xw_fused.allFinite()) {
             track_ids.push_back(i);
         }
@@ -1284,9 +1284,6 @@ void LvbaSystem::optimizeCameraPoses()
 
     const int Npts = (int)track_ids.size();
     std::cout << "[optimizeCamPoses] usable tracks = " << Npts << ", cameras = " << M << std::endl;
-
-    // ... (中间构建 surf_map 的代码保持不变，省略以节省篇幅) ...
-    // ... 请保留原有的 cut_voxel 和 surf_map 构建逻辑 ...
 
     const double surf_voxel_size = dataset_io_->stage2_root_voxel_size_;
     const float surf_eigen_thr = dataset_io_->stage2_eigen_ratio_array_[0];
@@ -1369,7 +1366,6 @@ void LvbaSystem::optimizeCameraPoses()
     std::vector<Eigen::Vector3d> plane_n(Npts, Eigen::Vector3d::Zero());
     std::vector<double>          plane_d(Npts, 0.0);
 
-    // [修改] 增强了法向量计算的安全性
     auto recompute_local_planes = [&](){
         for (int pi = 0; pi < Npts; ++pi)
         {
@@ -1395,7 +1391,6 @@ void LvbaSystem::optimizeCameraPoses()
                 plane_n[pi].setZero(); plane_d[pi] = 0.0; continue;
             }
 
-            // [关键修改] 检查原始 direct 是否包含 NaN
             if (!node->direct.allFinite() || node->direct.norm() < 1e-6 || !node->center.allFinite()) {
                 plane_n[pi].setZero(); plane_d[pi] = 0.0; continue;
             }
@@ -1407,10 +1402,10 @@ void LvbaSystem::optimizeCameraPoses()
         }
     };
 
-    // 1) 计算平面
+    // 计算平面
     recompute_local_planes();
     for (auto& kv : surf_map) delete kv.second;
-    // 2) 构建Ceres问题
+
     ceres::Problem problem;
     ceres::Solver::Options options;
     options.max_num_iterations = 50; 
@@ -1418,7 +1413,6 @@ void LvbaSystem::optimizeCameraPoses()
     options.num_threads = std::max(1u, std::thread::hardware_concurrency());
     options.minimizer_progress_to_stdout = true;
 
-    // 添加 Pose 参数块 (保持不变)
     for (int k = 0; k < M; ++k) {
         problem.AddParameterBlock(qs[k].data(), 4, new ceres::EigenQuaternionManifold());
         problem.AddParameterBlock(ts[k].data(), 3);
@@ -1426,30 +1420,22 @@ void LvbaSystem::optimizeCameraPoses()
     problem.SetParameterBlockConstant(qs[0].data());
     problem.SetParameterBlockConstant(ts[0].data());
 
-    // 定义 Loss Function
     ceres::LossFunction* loss_function_reproj = new ceres::HuberLoss(1.0); 
     ceres::LossFunction* loss_function_plane  = new ceres::HuberLoss(0.1); 
 
-    // 用于标记哪些点是“幸存”下来的
     std::vector<bool> point_is_valid(Npts, false);
 
-    // [修改] 合并循环：在一个大循环里同时处理 参数块添加 和 残差添加
-    // 这样我们就可以在开头统一进行“丢弃”判断
-    const double sigma_px = 0.5; // 若你认为特征测量精度 ~0.5 px，可填 0.5
+    const double sigma_px = 0.5;
+    const double sigma_plane = 0.01;
 
     for (int pi = 0; pi < Npts; ++pi) {
         
         const Eigen::Vector3d& n = plane_n[pi];
         const double d = plane_d[pi];
 
-        // ---------------------------------------------------------
-        // [核心修改] 严格筛选：如果没有有效的平面约束，直接丢弃该点
-        // ---------------------------------------------------------
         bool has_valid_plane = (n.allFinite() && std::isfinite(d) && !n.isZero(1e-6));
         
         if (!has_valid_plane) {
-            // 没找到平面 -> 标记为无效 -> continue 跳过后续所有添加操作
-            // 这意味着这个点根本不会进入 Ceres 优化问题
             point_is_valid[pi] = false; 
             continue; 
         }
@@ -1457,10 +1443,10 @@ void LvbaSystem::optimizeCameraPoses()
         // 只有通过了上面的筛选，才标记为有效
         point_is_valid[pi] = true;
 
-        // 1. 添加 Point 参数块 (因为有平面，所以添加)
+        // 添加 Point 参数块 (因为有平面，所以添加)
         problem.AddParameterBlock(Xs[pi].data(), 3);
 
-        // 2. 添加 视觉重投影残差
+        // 添加 视觉重投影残差
         const int tid = track_ids[pi];
         const auto& tr = tracks_[tid]; 
         std::unordered_set<int> seen;
@@ -1483,16 +1469,14 @@ void LvbaSystem::optimizeCameraPoses()
                                      qs[cam_id].data(), ts[cam_id].data(), Xs[pi].data());
         }
 
-        // 3. 添加 点-面残差
+        // 添加 点-面残差
         // double r10 = (std::abs(n(0)) < 1e-12) ? 1e12 : std::abs(n(1)/n(0));
         // double r12 = (std::abs(n(2)) < 1e-12) ? 1e12 : std::abs(n(1)/n(2));
-        // double sigma_plane = (r10>10 && r12>10) ? 0.02 : 0.05; 
-        double sigma_plane = 0.01;
+        // sigma_plane = (r10>10 && r12>10) ? 0.02 : 0.05; 
         ceres::CostFunction* plane_cost = PointPlaneErrorWhitened::Create(n, d, sigma_plane);
         problem.AddResidualBlock(plane_cost, nullptr, Xs[pi].data());
     }
 
-    // 6) 求解
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
     std::cout << "[optimizeCamPoses] " << summary.BriefReport() << std::endl;
@@ -1502,8 +1486,6 @@ void LvbaSystem::optimizeCameraPoses()
         return;
     }
 
-    //---------------- 回写结果 ----------------
-    // Pose 回写 (保持不变)
     for (int k = 0; k < M; ++k) {
         Eigen::Quaterniond q_eig(qs[k][0], qs[k][1], qs[k][2], qs[k][3]);
         q_eig.normalize();
@@ -1511,11 +1493,9 @@ void LvbaSystem::optimizeCameraPoses()
         tcw_all_optimized_[k] = Eigen::Vector3d(ts[k][0], ts[k][1], ts[k][2]);
     }
 
-    // [修改] Points 回写：只回写“幸存”的点，其他的设为无效或清除
     int valid_cnt = 0;
     for (int pi = 0; pi < Npts; ++pi) {
         if (point_is_valid[pi]) {
-            // 这是一个好点，更新它的坐标
             Eigen::Vector3d X_new(Xs[pi][0], Xs[pi][1], Xs[pi][2]);
             tracks_[ track_ids[pi] ].Xw_fused = X_new;
             valid_cnt++;
@@ -1706,7 +1686,7 @@ void LvbaSystem::visualizeProj() {
     std::cout << "[visualizeProj] global mean post: " << global_err_post << "\n";
 
     std::cout << "[visualizeProj] done. saved to: " << out_dir << std::endl;
-    std::string dir = dataset_path_ + "colmap/colored_merged.pcd";
+    std::string dir = dataset_path_ + "Colmap/colored_merged.pcd";
     VisualizeOptComparison(images_ids_, true, dir);
 }
 
@@ -1798,13 +1778,11 @@ bool LvbaSystem::ProjectToImage(
     const Eigen::Vector3d& Xw,
     double* u, double* v, double* Zc) const
 {
-    // 世界->相机
     const Eigen::Vector3d Xc = Rcw * Xw + tcw;
     const double z = Xc.z();
     if (Zc) *Zc = z;
-    if (z <= 1e-6) return false;  // 在相机后方/接近零深度，丢弃
+    if (z <= 1e-6) return false;
 
-    // 归一化坐标
     const double xn = Xc.x() / z;
     const double yn = Xc.y() / z;
 
@@ -1841,16 +1819,19 @@ void LvbaSystem::VisualizeOptComparison(
     const auto& x_buf_opt = dataset_io_->x_buf_;
     const auto& x_buf_bef = dataset_io_->x_buf_before_;
 
-    // 聚合的彩色点云
     pcl::PointCloud<pcl::PointXYZRGB>::Ptr merged(new pcl::PointCloud<pcl::PointXYZRGB>());
-    merged->reserve(3000000); // 预留一些容量，可按需调整
+    merged->reserve(3000000);
     pcl::PointCloud<pcl::PointXYZRGB>::Ptr merged_b(new pcl::PointCloud<pcl::PointXYZRGB>());
-    merged_b->reserve(3000000); // 预留一些容量，可按需调整
+    merged_b->reserve(3000000);
 
-    // 遍历每一帧
-    // fout_poses_before.open(dataset_path_ + "colmap/before_sparse/images.txt", std::ios::out);
-    // fout_poses_after.open(dataset_path_ + "colmap/after_sparse/images.txt", std::ios::out);
-
+    if(colmap_output_enable_)
+    {
+        std::string sparse_dir = dataset_path_ + "Colmap/sparse/";
+        if (!fs::exists(sparse_dir)) fs::create_directories(sparse_dir);
+        fout_poses_after.open(sparse_dir + "images.txt", std::ios::out);
+        // fout_poses_before.open(dataset_path_ + "Colmap/before_sparse/images.txt", std::ios::out);
+    }
+    
     for (size_t k = 0; k < image_ids.size(); ++k) {
         const double img_id = image_ids[k];
         const std::string img_path = getImagePath(img_id);        
@@ -1900,33 +1881,37 @@ void LvbaSystem::VisualizeOptComparison(
         const Eigen::Vector3d& tcw = tcw_all_optimized_[k];
         const Eigen::Matrix3d& Rcw_b = Rcw_all_[k];
         const Eigen::Vector3d& tcw_b = tcw_all_[k];
-        // colmap 格式
+        
+        // Colmap 格式
         Eigen::Quaterniond q(Rcw);
         Eigen::Vector3d t = tcw;
         Eigen::Quaterniond q_b(Rcw_b);
         Eigen::Vector3d t_b = tcw_b;
-        // fout_poses_after << k << " "
-        //           << std::fixed << std::setprecision(6)  // 保证浮点数精度为6位
-        //           << q.w() << " " << q.x() << " " << q.y() << " " << q.z() << " "
-        //           << t.x() << " " << t.y() << " " << t.z() << " "
-        //           << 1 << " "  // CAMERA_ID (假设相机ID为1)
-        //           << k << ".jpg" << std::endl;
-        // fout_poses_after << "0.0 0.0 -1" << std::endl;
+        
+        if(colmap_output_enable_)
+        {        
+            // fout_poses_before << k << " "
+            //        << std::fixed << std::setprecision(6)
+            //        << q_b.w() << " " << q_b.x() << " " << q_b.y() << " " << q_b.z() << " "
+            //        << t_b.x() << " " << t_b.y() << " " << t_b.z() << " "
+            //        << 1 << " "  // CAMERA_ID
+            //        << k << ".jpg" << std::endl;
+            // fout_poses_before << "0.0 0.0 -1" << std::endl;
+            fout_poses_after << k << " "
+                    << std::fixed << std::setprecision(6)
+                    << q.w() << " " << q.x() << " " << q.y() << " " << q.z() << " "
+                    << t.x() << " " << t.y() << " " << t.z() << " "
+                    << 1 << " "  // CAMERA_ID
+                    << k << ".jpg" << std::endl;
+            fout_poses_after << "0.0 0.0 -1" << std::endl;
 
-        // fout_poses_before << k << " "
-        //           << std::fixed << std::setprecision(6)  // 保证浮点数精度为6位
-        //           << q_b.w() << " " << q_b.x() << " " << q_b.y() << " " << q_b.z() << " "
-        //           << t_b.x() << " " << t_b.y() << " " << t_b.z() << " "
-        //           << 1 << " "  // CAMERA_ID (假设相机ID为1)
-        //           << k << ".jpg" << std::endl;
-        // fout_poses_before << "0.0 0.0 -1" << std::endl;
+            std::string images_dir = dataset_path_ + "Colmap/images/";
+            if (!fs::exists(images_dir)) fs::create_directories(images_dir);
+            cv::Mat undist;
+            dataset_io_->undistortImage(img, undist);
+            cv::imwrite(images_dir + std::to_string(k) + ".jpg", undist);
+        }
 
-        const std::string out = dataset_path_ + "colmap/images/" + std::to_string(k) + ".jpg";
-
-        cv::Mat undist;
-        dataset_io_->undistortImage(img, undist);
-        cv::imwrite(out, undist);
-        // colmap 格式
         std::vector<float> zbuf(W * H, std::numeric_limits<float>::infinity());
         std::vector<pcl::PointXYZRGB> pixbuf(W * H);
         const float eps = 1e-6f;
@@ -2003,39 +1988,32 @@ void LvbaSystem::VisualizeOptComparison(
         *merged_b += *colored_b;
     }
 
+    if(colmap_output_enable_)
+    {
+        std::cout << "[Colorize] Merged colored cloud size = " << merged->size() << "\n";
+        down_sampling_voxel2(*merged, filter_size_points3D_);
+        pcl::io::savePCDFileBinary(merged_pcd_path, *merged);
+        std::cout << "[Colorize] Downsampled size = " << merged->size() << "\n";
+
+        std::string sparse_dir = dataset_path_ + "Colmap/sparse/";
+        if (!fs::exists(sparse_dir)) fs::create_directories(sparse_dir);
+        fout_points_after.open(sparse_dir + "points3D.txt", std::ios::out);
+        for (size_t i = 0; i < merged->size(); ++i) 
+        {
+            const auto& point = merged->points[i];
+            fout_points_after << i << " "
+                        << std::fixed << std::setprecision(6)
+                        << point.x << " " << point.y << " " << point.z << " "
+                        << static_cast<int>(point.r) << " "
+                        << static_cast<int>(point.g) << " "
+                        << static_cast<int>(point.b) << " "
+                        << 0 << std::endl;
+        }
+    }
+
     pub_cloud_b_ = merged_b;
-
-
-
-    // std::cout << "[Colorize] Merged colored cloud size = " << merged->size() << "\n";
-    // pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud_downsampled(new pcl::PointCloud<pcl::PointXYZRGB>());
-    // if (merged->size() > 8000000) {
-    //     pcl::VoxelGrid<pcl::PointXYZRGB> voxel_grid;
-    //     voxel_grid.setInputCloud(merged);
-    //     voxel_grid.setLeafSize(0.15f, 0.15f, 0.15f); 
-    //     voxel_grid.filter(*cloud_downsampled);
-    //     merged = cloud_downsampled;
-    // }
-    // std::cout << "[Colorize] Merged colored cloud size = " << merged->size() << "\n";
-
     pub_cloud_ = merged;
 
-    // fout_points_after.open(dataset_path_+ "colmap/after_sparse/points3D.txt", std::ios::out);
-    // for (size_t i = 0; i < merged->size(); ++i) 
-    // {
-    //     // std::cout << i << std::endl;
-    //     const auto& point = merged->points[i];
-    //     fout_points_after << i << " "
-    //                 << std::fixed << std::setprecision(6)
-    //                 << point.x << " " << point.y << " " << point.z << " "
-    //                 << static_cast<int>(point.r) << " "
-    //                 << static_cast<int>(point.g) << " "
-    //                 << static_cast<int>(point.b) << " "
-    //                 << 0 << std::endl;
-    // }
-
-    // std::cout << "color after done" << std::endl;
-    // std::cout << "color before done" << std::endl;
     std::vector<pcl::PointCloud<PointType>::Ptr>().swap(dataset_io_->pl_fulls_);
 }
 

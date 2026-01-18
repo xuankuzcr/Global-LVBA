@@ -138,9 +138,11 @@ public:
     std::vector<Eigen::Vector3d> tcw_all_, tcw_all_optimized_;
 
     int obser_thr_ = 3;
-    std::ofstream fout_points_after,fout_points_before, fout_poses_after, fout_poses_before;
+    std::ofstream fout_points_after, fout_points_before, fout_poses_after, fout_poses_before;
 
-    double min_view_angle_deg_, reproj_mean_thr_px_;
+    double min_view_angle_deg_, reproj_mean_thr_px_, filter_size_points3D_;
+
+    bool colmap_output_enable_;
 };
 
 }

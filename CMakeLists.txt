@@ -70,8 +70,8 @@ target_link_libraries(lvba_system
     ${catkin_LIBRARIES}
     ${Sophus_LIBRARIES}
     ${SIFTGPU_LIBS}
-    GLEW::GLEW             # SiftGPU 依赖 GLEW
-    GLUT::GLUT             # SiftGPU 默认用 GLUT 创建 GL 上下文
+    GLEW::GLEW
+    GLUT::GLUT 
     OpenGL::GL
 )
 

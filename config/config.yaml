@@ -43,4 +43,8 @@ BALM_stage2:
 
 track_fusion:
   min_view_angle: 8.0 # degree 
-  reproj_mean_thr: 3.0 
+  reproj_mean_thr: 3.0
+
+colmap_output:
+  enable: false 
+  filter_size_points3D: 0.01

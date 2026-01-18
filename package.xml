@@ -4,14 +4,14 @@
   <version>0.0.0</version>
 
   <description>
-    lvba
+    Global LiDAR-Visual Bundle Adjustment
   </description>
 
-  <maintainer email="dev@livoxtech.com">claydergc</maintainer>
+  <maintainer email="zhengcr@connect.hku.hk">Chunran Zheng</maintainer>
 
-  <license>BSD</license>
+  <license>MIT</license>
 
-  <author email="zhangji@cmu.edu">Ji Zhang</author>
+  <author email="zhengcr@connect.hku.hk">Chunran Zheng</author>
   
   <buildtool_depend>catkin</buildtool_depend>
   <build_depend>geometry_msgs</build_depend>
