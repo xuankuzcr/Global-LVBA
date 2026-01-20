@@ -15,9 +15,11 @@
 #include <sqlite3.h>
 #include <sstream>
 #include <utility>
+#include <unordered_map>
 
 #include "BALM/tools.hpp"
 #include "BALM/bavoxel.hpp"
+#include "pose_visualizer.h"
 
 namespace fs = std::filesystem;
 
@@ -79,6 +81,10 @@ public:
     std::string getPcdPath(double pcd_id);
 
     void pubRGBCloud();
+    
+    // 3D可视化
+    void launchVisualizer();
+    void computePointCorrespondences();
 
     ros::Publisher pub_path_, pub_test_, pub_show_, pub_cute_, pub_cloud_before_, pub_cloud_after_, pub_cloud_map_;
     void data_show(vector<IMUST> x_buf, vector<pcl::PointCloud<PointType>::Ptr> &pl_fulls);
@@ -143,6 +149,13 @@ public:
     double min_view_angle_deg_, reproj_mean_thr_px_, filter_size_points3D_;
 
     bool colmap_output_enable_;
+    
+    // Point correspondences for morph animation (computed before pl_fulls_ is released)
+    std::vector<PointCorrespondence> pointCorrespondences_;
+    
+    // Global reprojection errors from visualizeProj (for display in visualizer)
+    double reproj_error_before_ = 0.0;
+    double reproj_error_after_ = 0.0;
 };
 
 }

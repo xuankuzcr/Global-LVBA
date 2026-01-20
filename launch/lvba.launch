@@ -6,8 +6,8 @@
 
 	<node pkg="Global-LVBA" type="lidar_visual_ba" name="lv_ba" output="screen"/>
 
-	<group if="$(arg rviz)">
+	<!-- <group if="$(arg rviz)">
 		<node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz" args="-d $(find Global-LVBA)/rviz_cfg/lv_ba.rviz" />
-	</group>
+	</group> -->
 launch-prefix="gdb -ex run --args"
 </launch> 	

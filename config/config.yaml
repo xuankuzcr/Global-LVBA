@@ -20,10 +20,10 @@ extrin_calib:
   Pcl: [0.0194384, 0.104689,-0.0251952]
 
 data_config:
-  data_path: "dataset/CBD_Building_01/"
+  data_path: "globallvba_datasets/Retail_Street/"
   colmap_db_path: "Colmap/colmap_sub5.db"
   image_sample_step: 5
-  enable_lidar_ba: false
+  enable_lidar_ba: true
   enable_visual_ba: true
 
 window_ba:

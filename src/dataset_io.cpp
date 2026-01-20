@@ -61,7 +61,10 @@ void DatasetIO::readParameters(ros::NodeHandle &nh)
     fx_ *= resize_scale_; fy_ *= resize_scale_;
     cx_ *= resize_scale_; cy_ *= resize_scale_;
 
-    dataset_path_ = std::string(ROOT_DIR) + dataset_path_;
+    // 如果dataset_path_不是绝对路径，则添加ROOT_DIR前缀
+    if (dataset_path_.empty() || dataset_path_[0] != '/') {
+        dataset_path_ = std::string(ROOT_DIR) + dataset_path_;
+    }
     colmap_db_path_ = dataset_path_ + colmap_db_path_;
 }
 

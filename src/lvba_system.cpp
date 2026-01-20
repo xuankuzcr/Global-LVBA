@@ -1,4 +1,6 @@
 #include "lvba_system.h"
+#include <limits>
+#include <unordered_set>
 
 namespace lvba {
     
@@ -30,6 +32,10 @@ void LvbaSystem::runFullPipeline()
     initFromDatasetIO();
     if(enable_lidar_ba_) runLidarBA();
     if(enable_visual_ba_) runVisualBAWithLidarAssist();
+    
+    // Launch 3D visualizer (will block until window is closed)
+    launchVisualizer();
+    
     ros::spin();
 }
 
@@ -1684,6 +1690,10 @@ void LvbaSystem::visualizeProj() {
     global_err_post /= global_cnt;
     std::cout << "[visualizeProj] global mean pre: " << global_err_pre << "\n";
     std::cout << "[visualizeProj] global mean post: " << global_err_post << "\n";
+    
+    // Save to member variables for visualizer display
+    reproj_error_before_ = global_err_pre;
+    reproj_error_after_ = global_err_post;
 
     std::cout << "[visualizeProj] done. saved to: " << out_dir << std::endl;
     std::string dir = dataset_path_ + "Colmap/colored_merged.pcd";
@@ -1819,6 +1829,14 @@ void LvbaSystem::VisualizeOptComparison(
     const auto& x_buf_opt = dataset_io_->x_buf_;
     const auto& x_buf_bef = dataset_io_->x_buf_before_;
 
+    // Clear point correspondences
+    pointCorrespondences_.clear();
+    
+    // Maps to store point ID -> (position, color) for before and after
+    // Point ID = global unique identifier for each original LiDAR point
+    std::unordered_map<uint64_t, std::pair<Eigen::Vector3f, Eigen::Vector3f>> afterPoints;  // ID -> (pos, color)
+    std::unordered_map<uint64_t, std::pair<Eigen::Vector3f, Eigen::Vector3f>> beforePoints; // ID -> (pos, color)
+
     pcl::PointCloud<pcl::PointXYZRGB>::Ptr merged(new pcl::PointCloud<pcl::PointXYZRGB>());
     merged->reserve(3000000);
     pcl::PointCloud<pcl::PointXYZRGB>::Ptr merged_b(new pcl::PointCloud<pcl::PointXYZRGB>());
@@ -1829,14 +1847,12 @@ void LvbaSystem::VisualizeOptComparison(
         std::string sparse_dir = dataset_path_ + "Colmap/sparse/";
         if (!fs::exists(sparse_dir)) fs::create_directories(sparse_dir);
         fout_poses_after.open(sparse_dir + "images.txt", std::ios::out);
-        // fout_poses_before.open(dataset_path_ + "Colmap/before_sparse/images.txt", std::ios::out);
     }
     
     for (size_t k = 0; k < image_ids.size(); ++k) {
         const double img_id = image_ids[k];
         const std::string img_path = getImagePath(img_id);        
 
-        // 读图（BGR）
         cv::Mat img = cv::imread(img_path, cv::IMREAD_COLOR);
         if (img.empty()) {
             std::cerr << "[Colorize] Failed to load image: " << img_path << "\n";
@@ -1848,28 +1864,29 @@ void LvbaSystem::VisualizeOptComparison(
         }
         const int W = img.cols, H = img.rows;
 
-        //-----------------------多帧合并（内存点云）----------------------//
         pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_w_all_opt(new pcl::PointCloud<pcl::PointXYZ>());
         pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_w_all_orig(new pcl::PointCloud<pcl::PointXYZ>());
 
+        // Store global unique IDs for each point (frame_idx << 32 | point_idx)
+        std::vector<uint64_t> pointIDs;
+
         for (size_t idx = 0; idx < x_buf_opt.size(); ++idx) {
-            if (std::fabs(x_buf_opt[idx].t - img_id) > 0.5) {
-                continue;
-            }
+            if (std::fabs(x_buf_opt[idx].t - img_id) > 0.5) continue;
             if (idx >= pl_fulls.size()) continue;
             const auto& pl_body = pl_fulls[idx];
             const IMUST& pose_opt = x_buf_opt[idx];
             const IMUST& pose_bef = x_buf_bef[idx];
 
-            for (const auto& pb : pl_body->points) {
+            for (size_t pi = 0; pi < pl_body->points.size(); ++pi) {
+                const auto& pb = pl_body->points[pi];
                 Eigen::Vector3d Xw_opt = pose_opt.R * Eigen::Vector3d(pb.x, pb.y, pb.z) + pose_opt.p;
-                cloud_w_all_opt->emplace_back(static_cast<float>(Xw_opt.x()),
-                                              static_cast<float>(Xw_opt.y()),
-                                              static_cast<float>(Xw_opt.z()));
+                cloud_w_all_opt->emplace_back((float)Xw_opt.x(), (float)Xw_opt.y(), (float)Xw_opt.z());
                 Eigen::Vector3d Xw_orig = pose_bef.R * Eigen::Vector3d(pb.x, pb.y, pb.z) + pose_bef.p;
-                cloud_w_all_orig->emplace_back(static_cast<float>(Xw_orig.x()),
-                                               static_cast<float>(Xw_orig.y()),
-                                               static_cast<float>(Xw_orig.z()));
+                cloud_w_all_orig->emplace_back((float)Xw_orig.x(), (float)Xw_orig.y(), (float)Xw_orig.z());
+                
+                // Generate unique ID: frame_index << 32 | point_index
+                uint64_t pointID = (static_cast<uint64_t>(idx) << 32) | static_cast<uint64_t>(pi);
+                pointIDs.push_back(pointID);
             }
         }
         if (cloud_w_all_opt->empty() || cloud_w_all_orig->empty()) {
@@ -1882,26 +1899,16 @@ void LvbaSystem::VisualizeOptComparison(
         const Eigen::Matrix3d& Rcw_b = Rcw_all_[k];
         const Eigen::Vector3d& tcw_b = tcw_all_[k];
         
-        // Colmap 格式
         Eigen::Quaterniond q(Rcw);
         Eigen::Vector3d t = tcw;
-        Eigen::Quaterniond q_b(Rcw_b);
-        Eigen::Vector3d t_b = tcw_b;
         
         if(colmap_output_enable_)
         {        
-            // fout_poses_before << k << " "
-            //        << std::fixed << std::setprecision(6)
-            //        << q_b.w() << " " << q_b.x() << " " << q_b.y() << " " << q_b.z() << " "
-            //        << t_b.x() << " " << t_b.y() << " " << t_b.z() << " "
-            //        << 1 << " "  // CAMERA_ID
-            //        << k << ".jpg" << std::endl;
-            // fout_poses_before << "0.0 0.0 -1" << std::endl;
             fout_poses_after << k << " "
                     << std::fixed << std::setprecision(6)
                     << q.w() << " " << q.x() << " " << q.y() << " " << q.z() << " "
                     << t.x() << " " << t.y() << " " << t.z() << " "
-                    << 1 << " "  // CAMERA_ID
+                    << 1 << " "
                     << k << ".jpg" << std::endl;
             fout_poses_after << "0.0 0.0 -1" << std::endl;
 
@@ -1914,9 +1921,12 @@ void LvbaSystem::VisualizeOptComparison(
 
         std::vector<float> zbuf(W * H, std::numeric_limits<float>::infinity());
         std::vector<pcl::PointXYZRGB> pixbuf(W * H);
+        std::vector<size_t> idxbuf(W * H, SIZE_MAX);  // Store point index
         const float eps = 1e-6f;
         
-        for (const auto& p : cloud_w_all_opt->points) {
+        // Z-buffer pass for "after" points (using optimized camera pose)
+        for (size_t pi = 0; pi < cloud_w_all_opt->size(); ++pi) {
+            const auto& p = cloud_w_all_opt->points[pi];
             Eigen::Vector3d Xw(p.x, p.y, p.z);
         
             double u = 0, v = 0, zc = 0;
@@ -1928,7 +1938,6 @@ void LvbaSystem::VisualizeOptComparison(
         
             const int idx = vv * W + uu;
         
-            // 只保留深度最近（zc越小越近）
             if (zc + eps < zbuf[idx]) {
                 const cv::Vec3b bgr = img.at<cv::Vec3b>(vv, uu);
         
@@ -1938,37 +1947,50 @@ void LvbaSystem::VisualizeOptComparison(
         
                 zbuf[idx]   = static_cast<float>(zc);
                 pixbuf[idx] = cp;
+                idxbuf[idx] = pi;
             }
         }
         
-        // 把每个像素最终留下的“最近点”收集到 colored 里
+        // Collect "after" colored points and store with ID
         pcl::PointCloud<pcl::PointXYZRGB>::Ptr colored(new pcl::PointCloud<pcl::PointXYZRGB>());
-        colored->reserve(W * H); // 粗略预留，可不写
+        colored->reserve(W * H);
         for (int i = 0; i < W * H; ++i) {
-            if (std::isfinite(zbuf[i])) colored->push_back(pixbuf[i]);
+            if (std::isfinite(zbuf[i])) {
+                colored->push_back(pixbuf[i]);
+                
+                size_t pi = idxbuf[i];
+                if (pi < pointIDs.size()) {
+                    uint64_t id = pointIDs[pi];
+                    const auto& p = pixbuf[i];
+                    afterPoints[id] = std::make_pair(
+                        Eigen::Vector3f(p.x, p.y, p.z),
+                        Eigen::Vector3f(p.r / 255.0f, p.g / 255.0f, p.b / 255.0f)
+                    );
+                }
+            }
         }
 
         *merged += *colored;
 
+        // Z-buffer pass for "before" points (using original camera pose)
         std::vector<float> zbuf_b(W * H, std::numeric_limits<float>::infinity());
         std::vector<pcl::PointXYZRGB> pixbuf_b(W * H);
-        const float eps_b = 1e-6f;
-        for (const auto& p : cloud_w_all_orig->points) {
+        std::vector<size_t> idxbuf_b(W * H, SIZE_MAX);
+        
+        for (size_t pi = 0; pi < cloud_w_all_orig->size(); ++pi) {
+            const auto& p = cloud_w_all_orig->points[pi];
             Eigen::Vector3d Xw(p.x, p.y, p.z);
 
             double u = 0, v = 0, zc = 0;
-
             if (!ProjectToImage(Rcw_b, tcw_b, Xw, &u, &v, &zc)) continue;
 
             int uu = static_cast<int>(std::round(u));
             int vv = static_cast<int>(std::round(v));
-
             if (uu < 0 || uu >= W || vv < 0 || vv >= H) continue;
 
             const int idx = vv * W + uu;
         
-            // 只保留深度最近（zc越小越近）
-            if (zc + eps_b < zbuf_b[idx]) {
+            if (zc + eps < zbuf_b[idx]) {
                 const cv::Vec3b bgr = img.at<cv::Vec3b>(vv, uu);
         
                 pcl::PointXYZRGB cp;
@@ -1977,13 +1999,27 @@ void LvbaSystem::VisualizeOptComparison(
         
                 zbuf_b[idx]   = static_cast<float>(zc);
                 pixbuf_b[idx] = cp;
+                idxbuf_b[idx] = pi;
             }
         }
-        // 把每个像素最终留下的“最近点”收集到 colored 里
+        
+        // Collect "before" colored points and store with ID
         pcl::PointCloud<pcl::PointXYZRGB>::Ptr colored_b(new pcl::PointCloud<pcl::PointXYZRGB>());
-        colored_b->reserve(W * H); // 粗略预留，可不写
+        colored_b->reserve(W * H);
         for (int i = 0; i < W * H; ++i) {
-            if (std::isfinite(zbuf_b[i])) colored_b->push_back(pixbuf_b[i]);
+            if (std::isfinite(zbuf_b[i])) {
+                colored_b->push_back(pixbuf_b[i]);
+                
+                size_t pi = idxbuf_b[i];
+                if (pi < pointIDs.size()) {
+                    uint64_t id = pointIDs[pi];
+                    const auto& p = pixbuf_b[i];
+                    beforePoints[id] = std::make_pair(
+                        Eigen::Vector3f(p.x, p.y, p.z),
+                        Eigen::Vector3f(p.r / 255.0f, p.g / 255.0f, p.b / 255.0f)
+                    );
+                }
+            }
         }
         *merged_b += *colored_b;
     }
@@ -2009,10 +2045,50 @@ void LvbaSystem::VisualizeOptComparison(
                         << static_cast<int>(point.b) << " "
                         << 0 << std::endl;
         }
+        fout_points_after.close();
+        fout_poses_after.close();
     }
 
     pub_cloud_b_ = merged_b;
     pub_cloud_ = merged;
+    
+    // Build point correspondences by matching IDs between before and after
+    std::cout << "[VisualizeOptComparison] Building correspondences: afterPoints=" << afterPoints.size() 
+              << ", beforePoints=" << beforePoints.size() << std::endl;
+    
+    pointCorrespondences_.reserve(std::min(afterPoints.size(), beforePoints.size()));
+    
+    for (const auto& kv : afterPoints) {
+        uint64_t id = kv.first;
+        auto it = beforePoints.find(id);
+        if (it != beforePoints.end()) {
+            PointCorrespondence corr;
+            corr.posAfter = kv.second.first;       // After position (LiDAR BA后)
+            corr.posBefore = it->second.first;      // Before position (LiDAR BA前)
+            // Blend colors from both views (RGB)
+            corr.color = (kv.second.second + it->second.second) * 0.5f;
+            pointCorrespondences_.push_back(corr);
+        }
+    }
+    
+    std::cout << "[VisualizeOptComparison] Point correspondences (matched by ID): " << pointCorrespondences_.size() << std::endl;
+    
+    // Debug: verify correspondence data
+    if (!pointCorrespondences_.empty()) {
+        double totalDiff = 0.0;
+        double avgR = 0.0, avgG = 0.0, avgB = 0.0;
+        size_t n = std::min(pointCorrespondences_.size(), (size_t)1000);
+        for (size_t i = 0; i < n; ++i) {
+            const auto& c = pointCorrespondences_[i];
+            totalDiff += (c.posAfter - c.posBefore).norm();
+            avgR += c.color.x();
+            avgG += c.color.y();
+            avgB += c.color.z();
+        }
+        std::cout << "[VisualizeOptComparison] Sample avg position diff: " << (totalDiff / n) << " m" << std::endl;
+        std::cout << "[VisualizeOptComparison] Sample avg color: R=" << (avgR / n) 
+                  << " G=" << (avgG / n) << " B=" << (avgB / n) << std::endl;
+    }
 
     std::vector<pcl::PointCloud<PointType>::Ptr>().swap(dataset_io_->pl_fulls_);
 }
@@ -2046,5 +2122,248 @@ void LvbaSystem::pubRGBCloud() {
     cloud_pub_before_.publish(output_b);
 }
 
+void LvbaSystem::computePointCorrespondences() {
+    std::cout << "[computePointCorrespondences] Computing point correspondences for morph animation..." << std::endl;
+    
+    pointCorrespondences_.clear();
+    
+    // Use x_buf_before_ for BEFORE poses (original) and x_buf_ for AFTER poses (optimized)
+    const auto& x_buf_before = dataset_io_->x_buf_before_;  // Original poses
+    const auto& x_buf_after = dataset_io_->x_buf_;          // Optimized poses
+    const auto& pl_fulls = dataset_io_->pl_fulls_;
+    
+    std::cout << "[computePointCorrespondences] x_buf_before.size()=" << x_buf_before.size() 
+              << ", x_buf_after.size()=" << x_buf_after.size() 
+              << ", pl_fulls.size()=" << pl_fulls.size() << std::endl;
+    
+    size_t numFrames = std::min({x_buf_before.size(), x_buf_after.size(), pl_fulls.size()});
+    
+    if (numFrames == 0 || pl_fulls.empty()) {
+        std::cout << "[computePointCorrespondences] No data available (numFrames=" << numFrames << ")" << std::endl;
+        return;
+    }
+    
+    if (x_buf_before.empty()) {
+        std::cout << "[computePointCorrespondences] x_buf_before_ is empty!" << std::endl;
+        return;
+    }
+    
+    // Count total points and compute sample rate
+    size_t maxTotalPoints = 2000000;  // 2 million points max
+    size_t totalPoints = 0;
+    for (size_t i = 0; i < numFrames; ++i) {
+        if (pl_fulls[i] && !pl_fulls[i]->empty()) {
+            totalPoints += pl_fulls[i]->size();
+        }
+    }
+    
+    if (totalPoints == 0) {
+        std::cout << "[computePointCorrespondences] No points in pl_fulls!" << std::endl;
+        return;
+    }
+    
+    size_t sampleRate = std::max((size_t)1, totalPoints / maxTotalPoints);
+    std::cout << "[computePointCorrespondences] Total points: " << totalPoints 
+              << ", sample rate: 1/" << sampleRate << std::endl;
+    
+    // First pass: compute Z range for JET colormap
+    float zMin = std::numeric_limits<float>::max();
+    float zMax = std::numeric_limits<float>::lowest();
+    for (size_t i = 0; i < numFrames; ++i) {
+        if (!pl_fulls[i] || pl_fulls[i]->empty()) continue;
+        const auto& cloud = *pl_fulls[i];
+        const IMUST& pose = x_buf_after[i];
+        for (size_t j = 0; j < cloud.size(); j += sampleRate * 10) {  // Sample for range
+            const auto& pt = cloud.points[j];
+            if (!std::isfinite(pt.z)) continue;
+            Eigen::Vector3d p_local(pt.x, pt.y, pt.z);
+            Eigen::Vector3d p_world = pose.R * p_local + pose.p;
+            zMin = std::min(zMin, (float)p_world.z());
+            zMax = std::max(zMax, (float)p_world.z());
+        }
+    }
+    float zRange = zMax - zMin;
+    if (zRange < 0.1f) zRange = 1.0f;
+    
+    std::cout << "[computePointCorrespondences] Z range: " << zMin << " to " << zMax << std::endl;
+    
+    // JET colormap helper
+    auto jetColor = [](float v) -> Eigen::Vector3f {
+        v = std::max(0.0f, std::min(1.0f, v));
+        float r, g, b;
+        if (v < 0.25f) {
+            r = 0.0f; g = 4.0f * v; b = 1.0f;
+        } else if (v < 0.5f) {
+            r = 0.0f; g = 1.0f; b = 1.0f - 4.0f * (v - 0.25f);
+        } else if (v < 0.75f) {
+            r = 4.0f * (v - 0.5f); g = 1.0f; b = 0.0f;
+        } else {
+            r = 1.0f; g = 1.0f - 4.0f * (v - 0.75f); b = 0.0f;
+        }
+        return Eigen::Vector3f(r, g, b);
+    };
+    
+    pointCorrespondences_.reserve(std::min(totalPoints, maxTotalPoints));
+    
+    // Check if poses actually differ
+    double totalPoseDiff = 0.0;
+    for (size_t i = 0; i < numFrames; ++i) {
+        totalPoseDiff += (x_buf_before[i].p - x_buf_after[i].p).norm();
+    }
+    std::cout << "[computePointCorrespondences] Total pose difference: " << totalPoseDiff << " m" << std::endl;
+    
+    for (size_t i = 0; i < numFrames; ++i) {
+        if (!pl_fulls[i] || pl_fulls[i]->empty()) continue;
+        
+        const auto& cloud = *pl_fulls[i];
+        const IMUST& pose_before = x_buf_before[i];
+        const IMUST& pose_after = x_buf_after[i];
+        
+        // Transform matrices
+        Eigen::Matrix3d R_before = pose_before.R;
+        Eigen::Vector3d t_before = pose_before.p;
+        Eigen::Matrix3d R_after = pose_after.R;
+        Eigen::Vector3d t_after = pose_after.p;
+        
+        for (size_t j = 0; j < cloud.size(); j += sampleRate) {
+            const auto& pt = cloud.points[j];
+            if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
+            
+            Eigen::Vector3d p_local(pt.x, pt.y, pt.z);
+            
+            // Transform to world coordinates
+            Eigen::Vector3d p_world_before = R_before * p_local + t_before;
+            Eigen::Vector3d p_world_after = R_after * p_local + t_after;
+            
+            PointCorrespondence corr;
+            corr.posBefore = p_world_before.cast<float>();
+            corr.posAfter = p_world_after.cast<float>();
+            
+            // Use JET colormap based on height (after position)
+            float normalizedZ = (corr.posAfter.z() - zMin) / zRange;
+            corr.color = jetColor(normalizedZ);
+            
+            pointCorrespondences_.push_back(corr);
+            
+            if (pointCorrespondences_.size() >= maxTotalPoints) break;
+        }
+        if (pointCorrespondences_.size() >= maxTotalPoints) break;
+    }
+    
+    std::cout << "[computePointCorrespondences] Computed " << pointCorrespondences_.size() << " correspondences" << std::endl;
+}
+
+void LvbaSystem::launchVisualizer() {
+    std::cout << "\n[PoseVisualizer] Launching 3D visualization..." << std::endl;
+    
+    // Note: pointCorrespondences_ already computed in VisualizeOptComparison() before pl_fulls_ was cleared
+    
+    PoseVisualizer viz;
+    if (!viz.init(1280, 720, "LVBA Camera Pose Optimization")) {
+        std::cerr << "[PoseVisualizer] Failed to initialize visualizer" << std::endl;
+        return;
+    }
+    
+    // Set point cloud data
+    if (pub_cloud_ && !pub_cloud_->empty()) {
+        viz.setPointCloud(pub_cloud_b_, pub_cloud_);
+    }
+    
+    // Set pre-computed point correspondences for morph animation
+    if (!pointCorrespondences_.empty()) {
+        viz.setPointCorrespondences(pointCorrespondences_);
+    } else {
+        std::cout << "[PoseVisualizer] Warning: No point correspondences available for morph animation" << std::endl;
+    }
+    
+    // Set camera poses
+    if (!Rcw_all_.empty() && !Rcw_all_optimized_.empty()) {
+        viz.setCameraPoses(Rcw_all_, tcw_all_, Rcw_all_optimized_, tcw_all_optimized_);
+    }
+    
+    // Set track data
+    if (!tracks_.empty() && !tracks_before_.empty()) {
+        std::vector<TrackViz> trackViz;
+        trackViz.reserve(std::min(tracks_.size(), tracks_before_.size()));
+        
+        for (size_t i = 0; i < std::min(tracks_.size(), tracks_before_.size()); ++i) {
+            TrackViz tv;
+            tv.Xw_before = tracks_before_[i].Xw_fused;
+            tv.Xw_after = tracks_[i].Xw_fused;
+            trackViz.push_back(tv);
+        }
+        viz.setTracks(trackViz);
+    }
+    
+    // Calculate statistics
+    double convergenceRatio = 0.0;
+    double meanErrorBefore = 0.0;
+    double meanErrorAfter = 0.0;
+    
+    // Calculate reprojection errors
+    if (!tracks_.empty() && !tracks_before_.empty()) {
+        int cnt_before = 0, cnt_after = 0;
+        double sum_before = 0.0, sum_after = 0.0;
+        
+        for (size_t tid = 0; tid < std::min(tracks_.size(), tracks_before_.size()); ++tid) {
+            const auto& tr_b = tracks_before_[tid];
+            const auto& tr_a = tracks_[tid];
+            
+            for (int idx_in_obs : tr_b.inlier_indices) {
+                if (idx_in_obs < 0 || idx_in_obs >= (int)tr_b.observations.size()) continue;
+                const auto& obs = tr_b.observations[idx_in_obs];
+                const int cam_id = obs.first;
+                const int kp_id = obs.second;
+                
+                if (cam_id < 0 || cam_id >= (int)Rcw_all_.size()) continue;
+                if (kp_id < 0 || kp_id >= (int)all_keypoints_[cam_id].size()) continue;
+                
+                const double u_obs = all_keypoints_[cam_id][kp_id].x;
+                const double v_obs = all_keypoints_[cam_id][kp_id].y;
+                
+                // Before error
+                {
+                    const Eigen::Vector3d Xc = Rcw_all_[cam_id] * tr_b.Xw_fused + tcw_all_[cam_id];
+                    if (Xc.z() > 1e-6) {
+                        const double u_proj = fx_ * Xc.x() / Xc.z() + cx_;
+                        const double v_proj = fy_ * Xc.y() / Xc.z() + cy_;
+                        sum_before += std::sqrt((u_proj - u_obs) * (u_proj - u_obs) + (v_proj - v_obs) * (v_proj - v_obs));
+                        cnt_before++;
+                    }
+                }
+                
+                // After error
+                {
+                    const Eigen::Vector3d Xc = Rcw_all_optimized_[cam_id] * tr_a.Xw_fused + tcw_all_optimized_[cam_id];
+                    if (Xc.z() > 1e-6) {
+                        const double u_proj = fx_ * Xc.x() / Xc.z() + cx_;
+                        const double v_proj = fy_ * Xc.y() / Xc.z() + cy_;
+                        sum_after += std::sqrt((u_proj - u_obs) * (u_proj - u_obs) + (v_proj - v_obs) * (v_proj - v_obs));
+                        cnt_after++;
+                    }
+                }
+            }
+        }
+        
+        if (cnt_before > 0) meanErrorBefore = sum_before / cnt_before;
+        if (cnt_after > 0) meanErrorAfter = sum_after / cnt_after;
+        
+        convergenceRatio = (double)tracks_.size() / std::max(1.0, (double)(tracks_.size() + tracks_before_.size()));
+    }
+    
+    // Use global reprojection errors from visualizeProj if available (more accurate)
+    if (reproj_error_before_ > 0.0 || reproj_error_after_ > 0.0) {
+        meanErrorBefore = reproj_error_before_;
+        meanErrorAfter = reproj_error_after_;
+        std::cout << "[PoseVisualizer] Using visualizeProj errors: before=" << meanErrorBefore 
+                  << ", after=" << meanErrorAfter << std::endl;
+    }
+    
+    viz.setStats(convergenceRatio, meanErrorBefore, meanErrorAfter);
+    
+    // Run the visualizer (blocks until window is closed)
+    viz.run();
+    viz.shutdown();
+}
 
 }
