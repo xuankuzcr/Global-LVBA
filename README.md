@@ -88,6 +88,14 @@ roslaunch Global-LVBA lvba.launch
 
 After processing completes, a 3D visualizer window will automatically launch, allowing you to interactively explore the optimization results.
 
+<p align="center">
+  <img src="pics/imgui_visualizer.gif" alt="Global-LVBA Visulizer" width="100%"/>
+  <br/>
+  <span style="color:#a0a0a0; font-size:13px;">
+    This figure shows a demo with imgui-based visualizer.
+  </span>
+</p>
+
 ### Visualization Modes
 - **Before**: Point cloud before LiDAR BA optimization
 - **After**: Point cloud after camera pose optimization (RGB colored)
