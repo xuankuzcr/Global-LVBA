@@ -895,7 +895,7 @@ void LvbaSystem::BuildTracksAndFuse3D() {
                 if (!fetchDepthBilinear(all_depths_[im], u, v, d, 0.001f)) continue;
                 if (d <= 0.0f) continue;
 
-                Eigen::Vector3d Xc = backProjectCam(u, v, d, fx_, fy_, cx_, cy_);
+                Eigen::Vector3d Xc = backProjectCam(u, v, d, fx_, fy_, cx_, cy_, d0_, d1_, d2_, d3_);
                 Eigen::Vector3d Xw = camToWorld(Xc, Rcw_all_optimized_[im], tcw_all_optimized_[im]);
                 points3d[t] = Xw;
                 valid_mask[t] = 1;
@@ -1096,6 +1096,7 @@ void LvbaSystem::BuildTracksAndFuse3D() {
     }
     tracks_before_ = tracks_;
 
+    all_depths_.clear();
     // showTracksComparePCL();
     // saveTrackFeaturesOnImages();
 }

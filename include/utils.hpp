@@ -186,10 +186,44 @@ inline bool fetchDepthBilinear(const cv::Mat& depth, float u, float v, float& d_
     return d_out > 0.0f;
 }
 
-// ---- 像素+深度 -> 相机系3D ----
-inline Eigen::Vector3d backProjectCam(double u, double v, double d, double fx, double fy, double cx, double cy) {
-    // 针孔： Xc = [ (u-cx)/fx * d, (v-cy)/fy * d, d ]
-    return Eigen::Vector3d( (u - cx) / fx * d, (v - cy) / fy * d, d );
+// ---- 像素+深度 -> 相机系3D（含去畸变，Brown-Conrady模型）----
+inline Eigen::Vector3d backProjectCam(double u, double v, double d, 
+                                       double fx, double fy, double cx, double cy,
+                                       double k1, double k2, double p1, double p2) {
+    // 1. 归一化畸变坐标
+    double x_d = (u - cx) / fx;
+    double y_d = (v - cy) / fy;
+
+    // 2. 迭代去畸变
+    double x_u = x_d;
+    double y_u = y_d;
+
+    const int max_iter = 10;
+    const double eps = 1e-9;
+
+    for (int i = 0; i < max_iter; ++i) {
+        double r2 = x_u * x_u + y_u * y_u;
+        double r4 = r2 * r2;
+
+        double radial = 1.0 + k1 * r2 + k2 * r4;
+        double x_tan = 2.0 * p1 * x_u * y_u + p2 * (r2 + 2.0 * x_u * x_u);
+        double y_tan = p1 * (r2 + 2.0 * y_u * y_u) + 2.0 * p2 * x_u * y_u;
+
+        double x_new = (x_d - x_tan) / radial;
+        double y_new = (y_d - y_tan) / radial;
+
+        if (std::abs(x_new - x_u) < eps && std::abs(y_new - y_u) < eps) {
+            x_u = x_new;
+            y_u = y_new;
+            break;
+        }
+
+        x_u = x_new;
+        y_u = y_new;
+    }
+
+    // 3. 使用去畸变的归一化坐标反投影到3D
+    return Eigen::Vector3d(x_u * d, y_u * d, d);
 }
 
 // ---- 相机->世界：给定 Rcw, tcw (世界->相机)，则 Rwc=Rcw^T, twc = -Rcw^T*tcw ----
