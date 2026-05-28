@@ -155,6 +155,93 @@ struct Track {
     // double mad = -1.0;
 };
 
+struct CameraIntrinsics {
+    double fx = 0.0;
+    double fy = 0.0;
+    double cx = 0.0;
+    double cy = 0.0;
+    double k1 = 0.0;
+    double k2 = 0.0;
+    double p1 = 0.0;
+    double p2 = 0.0;
+};
+
+inline bool distortNormalized(const CameraIntrinsics& cam,
+                              double x, double y,
+                              double* xd, double* yd) {
+    if (xd == nullptr || yd == nullptr || !std::isfinite(x) || !std::isfinite(y)) return false;
+    const double r2 = x * x + y * y;
+    const double r4 = r2 * r2;
+    const double radial = 1.0 + cam.k1 * r2 + cam.k2 * r4;
+    const double x_tan = 2.0 * cam.p1 * x * y + cam.p2 * (r2 + 2.0 * x * x);
+    const double y_tan = cam.p1 * (r2 + 2.0 * y * y) + 2.0 * cam.p2 * x * y;
+    *xd = x * radial + x_tan;
+    *yd = y * radial + y_tan;
+    return std::isfinite(*xd) && std::isfinite(*yd);
+}
+
+inline bool projectCameraToPixel(const CameraIntrinsics& cam,
+                                 const Eigen::Vector3d& Xc,
+                                 double* u, double* v, double* Zc = nullptr) {
+    if (u == nullptr || v == nullptr || !Xc.allFinite()) return false;
+    const double Z = Xc.z();
+    if (Z <= 1e-12) return false;
+    const double x = Xc.x() / Z;
+    const double y = Xc.y() / Z;
+    double xd = 0.0, yd = 0.0;
+    if (!distortNormalized(cam, x, y, &xd, &yd)) return false;
+    *u = cam.fx * xd + cam.cx;
+    *v = cam.fy * yd + cam.cy;
+    if (Zc != nullptr) *Zc = Z;
+    return std::isfinite(*u) && std::isfinite(*v);
+}
+
+inline bool projectWorldToPixel(const CameraIntrinsics& cam,
+                                const Eigen::Matrix3d& Rcw,
+                                const Eigen::Vector3d& tcw,
+                                const Eigen::Vector3d& Xw,
+                                double* u, double* v, double* Zc = nullptr) {
+    return projectCameraToPixel(cam, Rcw * Xw + tcw, u, v, Zc);
+}
+
+inline bool undistortPixelToNormalized(const CameraIntrinsics& cam,
+                                       double u, double v,
+                                       double* x, double* y) {
+    if (x == nullptr || y == nullptr || !std::isfinite(u) || !std::isfinite(v)) return false;
+    if (std::abs(cam.fx) < 1e-12 || std::abs(cam.fy) < 1e-12) return false;
+
+    const double xd = (u - cam.cx) / cam.fx;
+    const double yd = (v - cam.cy) / cam.fy;
+    double xu = xd;
+    double yu = yd;
+
+    for (int iter = 0; iter < 8; ++iter) {
+        const double r2 = xu * xu + yu * yu;
+        const double r4 = r2 * r2;
+        const double radial = 1.0 + cam.k1 * r2 + cam.k2 * r4;
+        if (std::abs(radial) < 1e-12 || !std::isfinite(radial)) return false;
+        const double x_tan = 2.0 * cam.p1 * xu * yu + cam.p2 * (r2 + 2.0 * xu * xu);
+        const double y_tan = cam.p1 * (r2 + 2.0 * yu * yu) + 2.0 * cam.p2 * xu * yu;
+        xu = (xd - x_tan) / radial;
+        yu = (yd - y_tan) / radial;
+        if (!std::isfinite(xu) || !std::isfinite(yu)) return false;
+    }
+
+    *x = xu;
+    *y = yu;
+    return true;
+}
+
+inline bool backProjectPixelDepthDistorted(const CameraIntrinsics& cam,
+                                           double u, double v, double depth,
+                                           Eigen::Vector3d* Xc) {
+    if (Xc == nullptr || depth <= 0.0 || !std::isfinite(depth)) return false;
+    double x = 0.0, y = 0.0;
+    if (!undistortPixelToNormalized(cam, u, v, &x, &y)) return false;
+    *Xc = Eigen::Vector3d(x * depth, y * depth, depth);
+    return Xc->allFinite();
+}
+
 // ---- 小工具：像素→深度获取（支持 CV_32F / CV_16U），双线性插值 ----
 inline bool fetchDepthBilinear(const cv::Mat& depth, float u, float v, float& d_out, float depth_scale=1.0f) {
     if (depth.empty()) return false;
@@ -184,12 +271,6 @@ inline bool fetchDepthBilinear(const cv::Mat& depth, float u, float v, float& d_
 
     d_out = (1-du)*(1-dv)*d00 + du*(1-dv)*d10 + (1-du)*dv*d01 + du*dv*d11;
     return d_out > 0.0f;
-}
-
-// ---- 像素+深度 -> 相机系3D ----
-inline Eigen::Vector3d backProjectCam(double u, double v, double d, double fx, double fy, double cx, double cy) {
-    // 针孔： Xc = [ (u-cx)/fx * d, (v-cy)/fy * d, d ]
-    return Eigen::Vector3d( (u - cx) / fx * d, (v - cy) / fy * d, d );
 }
 
 // ---- 相机->世界：给定 Rcw, tcw (世界->相机)，则 Rwc=Rcw^T, twc = -Rcw^T*tcw ----

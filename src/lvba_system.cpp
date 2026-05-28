@@ -1,7 +1,115 @@
 #include "lvba_system.h"
+#include <chrono>
+#include <limits>
+#include <unordered_set>
 
 namespace lvba {
-    
+
+static bool ComputeMeanReproj(
+    const Eigen::Vector3d& Xw,
+    const std::unordered_map<int,int>& selected_ids,
+    const std::vector<std::pair<int,int>>& component,
+    const std::vector<std::vector<sift::Keypoint>>& all_keypoints,
+    const std::vector<Eigen::Matrix3d>& Rcw_all_optimized,
+    const std::vector<Eigen::Vector3d>& tcw_all_optimized,
+    const CameraIntrinsics& cam,
+    int min_count,
+    double& mean_reproj,
+    int& cnt_err)
+{
+    double sum_err = 0.0;
+    cnt_err = 0;
+    for (const auto& kv : selected_ids) {
+        const int comp_idx = kv.second;
+        if (comp_idx < 0 || comp_idx >= static_cast<int>(component.size())) continue;
+
+        const int img_id = component[comp_idx].first;
+        const int kp_id  = component[comp_idx].second;
+
+        if (img_id < 0 || img_id >= static_cast<int>(Rcw_all_optimized.size()) ||
+            img_id >= static_cast<int>(tcw_all_optimized.size())) continue;
+        if (img_id < 0 || img_id >= static_cast<int>(all_keypoints.size()) ||
+            kp_id < 0 || kp_id >= static_cast<int>(all_keypoints[img_id].size())) continue;
+
+        const double u_obs = all_keypoints[img_id][kp_id].x;
+        const double v_obs = all_keypoints[img_id][kp_id].y;
+
+        double u_hat = 0.0, v_hat = 0.0;
+        if (!projectWorldToPixel(cam, Rcw_all_optimized[img_id], tcw_all_optimized[img_id],
+                                 Xw, &u_hat, &v_hat)) continue;
+
+        const double du = u_hat - u_obs;
+        const double dv = v_hat - v_obs;
+        sum_err += std::sqrt(du * du + dv * dv);
+        ++cnt_err;
+    }
+
+    if (cnt_err < min_count) return false;
+    mean_reproj = sum_err / static_cast<double>(cnt_err);
+    return std::isfinite(mean_reproj);
+}
+
+static bool TriangulateTrackDLT(
+    const std::unordered_map<int,int>& selected_ids,
+    const std::vector<std::pair<int,int>>& component,
+    const std::vector<std::vector<sift::Keypoint>>& all_keypoints,
+    const std::vector<Eigen::Matrix3d>& Rcw_all_optimized,
+    const std::vector<Eigen::Vector3d>& tcw_all_optimized,
+    const CameraIntrinsics& cam,
+    Eigen::Vector3d& Xw_tri,
+    double& mean_reproj_tri,
+    int& cnt_reproj_tri)
+{
+    if (selected_ids.size() < 4) return false;
+
+    Eigen::Matrix4d AtA = Eigen::Matrix4d::Zero();
+    int equation_rows = 0;
+
+    for (const auto& kv : selected_ids) {
+        const int comp_idx = kv.second;
+        if (comp_idx < 0 || comp_idx >= static_cast<int>(component.size())) continue;
+
+        const int img_id = component[comp_idx].first;
+        const int kp_id  = component[comp_idx].second;
+        if (img_id < 0 || img_id >= static_cast<int>(Rcw_all_optimized.size()) ||
+            img_id >= static_cast<int>(tcw_all_optimized.size())) continue;
+        if (img_id < 0 || img_id >= static_cast<int>(all_keypoints.size()) ||
+            kp_id < 0 || kp_id >= static_cast<int>(all_keypoints[img_id].size())) continue;
+
+        const double u = all_keypoints[img_id][kp_id].x;
+        const double v = all_keypoints[img_id][kp_id].y;
+        double x = 0.0, y = 0.0;
+        if (!undistortPixelToNormalized(cam, u, v, &x, &y)) continue;
+        const Eigen::Matrix3d& Rcw = Rcw_all_optimized[img_id];
+        const Eigen::Vector3d& tcw = tcw_all_optimized[img_id];
+
+        Eigen::Matrix<double, 3, 4> P;
+        P.block<3, 3>(0, 0) = Rcw;
+        P.block<3, 1>(0, 3) = tcw;
+
+        const Eigen::Vector4d row_u = x * P.row(2).transpose() - P.row(0).transpose();
+        const Eigen::Vector4d row_v = y * P.row(2).transpose() - P.row(1).transpose();
+        AtA += row_u * row_u.transpose();
+        AtA += row_v * row_v.transpose();
+        equation_rows += 2;
+    }
+
+    if (equation_rows < 8) return false;
+
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix4d> solver(AtA);
+    if (solver.info() != Eigen::Success) return false;
+
+    const Eigen::Vector4d Xh = solver.eigenvectors().col(0);
+    if (std::abs(Xh.w()) < 1e-12) return false;
+
+    Xw_tri = Xh.head<3>() / Xh.w();
+    if (!Xw_tri.allFinite()) return false;
+
+    return ComputeMeanReproj(
+        Xw_tri, selected_ids, component, all_keypoints, Rcw_all_optimized,
+        tcw_all_optimized, cam, 4, mean_reproj_tri, cnt_reproj_tri);
+}
+
 LvbaSystem::LvbaSystem(ros::NodeHandle& nh) : nh_(nh)                                
 {
     dataset_io_.reset(new DatasetIO(nh_));
@@ -726,6 +834,7 @@ void LvbaSystem::extractAndMatchFeaturesGPU()
 
 void LvbaSystem::generateDepthWithVoxel() 
 {
+    const CameraIntrinsics cam{fx_, fy_, cx_, cy_, d0_, d1_, d2_, d3_};
     const size_t N = all_voxel_ids_.size();
     if (poses_.size() != N) {
         std::cerr << "[generateDepthWithVoxel] size mismatch: poses=" << poses_.size()
@@ -780,17 +889,11 @@ void LvbaSystem::generateDepthWithVoxel()
                 const double Z = pC.z();
                 if (Z < 1e-3) continue;
 
-                const double x = pC.x() / Z;
-                const double y = pC.y() / Z;
+                double uu = 0.0, vv = 0.0;
+                if (!projectCameraToPixel(cam, pC, &uu, &vv)) continue;
 
-                const double r2 = x * x + y * y;
-                const double x_dist = x * (1 + d0_ * r2 + d1_ * r2 * r2)
-                                    + 2 * d2_ * x * y + d3_ * (r2 + 2 * x * x);
-                const double y_dist = y * (1 + d0_ * r2 + d1_ * r2 * r2)
-                                    + d2_ * (r2 + 2 * y * y) + 2 * d3_ * x * y;
-
-                const int u = static_cast<int>(fx_ * x_dist + cx_);
-                const int v = static_cast<int>(fy_ * y_dist + cy_);
+                const int u = static_cast<int>(uu);
+                const int v = static_cast<int>(vv);
                 if (u < 0 || u >= image_width_ || v < 0 || v >= image_height_) continue;
 
                 float& d = depth.at<float>(v, u);
@@ -818,6 +921,7 @@ void LvbaSystem::generateDepthWithVoxel()
 void LvbaSystem::BuildTracksAndFuse3D() {
 
     const int N = static_cast<int>(all_keypoints_.size());
+    const CameraIntrinsics cam{fx_, fy_, cx_, cy_, d0_, d1_, d2_, d3_};
     std::cout << "[BuildTracksAndFuse3D] Building visual points from " << N << " images ...\n";
     // 初始化 obs_to_track
     std::vector<std::vector<int>> obs_to_track(N);
@@ -851,6 +955,11 @@ void LvbaSystem::BuildTracksAndFuse3D() {
     tracks_.reserve(100000);
 
     int num_tracked = 0;
+    int tri_candidates = 0;
+    int tri_valid = 0;
+    int tri_selected = 0;
+    int depth_selected = 0;
+    std::chrono::duration<double, std::milli> tri_time_total_ms(0.0);
     size_t total_components = 0;
     // BFS 建轨迹
     for (int i = 0; i < N; ++i) {
@@ -881,8 +990,34 @@ void LvbaSystem::BuildTracksAndFuse3D() {
                 for (auto &obs : component) obs_to_track[obs.first][obs.second] = -1;
                 continue;
             }
+            // 先按 image 去重；视角筛选仍按原始代码风格，用候选 3D 点到相机中心的方向做。
+            std::unordered_map<int,int> unique_id;  // img_id -> component index
+            unique_id.reserve(component.size());
+            for (int comp_idx = 0; comp_idx < static_cast<int>(component.size()); ++comp_idx) {
+                const int img_id = component[comp_idx].first;
+                if (!unique_id.count(img_id)) unique_id[img_id] = comp_idx;
+            }
 
-            // 反投影所有观测
+            if ((int)unique_id.size() < obser_thr_) {
+                for (auto &obs : component) obs_to_track[obs.first][obs.second] = -1;
+                continue;
+            }
+            const double cos_min_view_angle = std::cos(min_view_angle_deg_ * M_PI / 180.0);
+            std::vector<int> kept_obs_ids;
+
+            bool depth_ok = false;
+            Eigen::Vector3d Xw_depth = Eigen::Vector3d::Zero();
+            double mean_reproj_depth = std::numeric_limits<double>::infinity();
+            int cnt_reproj_depth = 0;
+
+            bool tri_ok = false;
+            Eigen::Vector3d Xw_tri = Eigen::Vector3d::Zero();
+            double mean_reproj_tri = std::numeric_limits<double>::infinity();
+            int cnt_reproj_tri = 0;
+            std::vector<int> kept_obs_ids_depth;
+            std::vector<int> kept_obs_ids_tri;
+
+            // depth-fused 候选：从深度有效观测生成 3D 点。
             std::vector<Eigen::Vector3d> points3d(component.size(), Eigen::Vector3d::Zero());
             std::vector<int> valid_mask(component.size(), 0);
             for (size_t t = 0; t < component.size(); ++t) {
@@ -895,7 +1030,8 @@ void LvbaSystem::BuildTracksAndFuse3D() {
                 if (!fetchDepthBilinear(all_depths_[im], u, v, d, 0.001f)) continue;
                 if (d <= 0.0f) continue;
 
-                Eigen::Vector3d Xc = backProjectCam(u, v, d, fx_, fy_, cx_, cy_);
+                Eigen::Vector3d Xc;
+                if (!backProjectPixelDepthDistorted(cam, u, v, d, &Xc)) continue;
                 Eigen::Vector3d Xw = camToWorld(Xc, Rcw_all_optimized_[im], tcw_all_optimized_[im]);
                 points3d[t] = Xw;
                 valid_mask[t] = 1;
@@ -903,150 +1039,170 @@ void LvbaSystem::BuildTracksAndFuse3D() {
 
             std::vector<int> idx_valid;
             for (size_t t = 0; t < points3d.size(); ++t) if (valid_mask[t]) idx_valid.push_back((int)t);
-            if ((int)idx_valid.size() < obser_thr_) {
-                for (auto &obs : component) obs_to_track[obs.first][obs.second] = -1;
-                continue;
+            if ((int)idx_valid.size() >= obser_thr_) {
+                Eigen::Vector3d anchor = points3d[idx_valid[0]];
+                std::vector<int> inliers;
+                inliers.reserve(idx_valid.size());
+                for (int id : idx_valid) {
+                    double dist = (points3d[id] - anchor).norm();
+                    if (dist < 0.12) inliers.push_back(id);
+                }
+
+                std::unordered_map<int,int> best_id;  // img_id -> chosen id
+                best_id.reserve(inliers.size());
+                for (int id : inliers) {
+                    int img_id = component[id].first;
+                    if (!best_id.count(img_id)) best_id[img_id] = id;
+                }
+
+                if ((int)best_id.size() >= obser_thr_) {
+                    for (const auto& kv : best_id) {
+                        Xw_depth += points3d[kv.second];
+                    }
+                    Xw_depth /= double(best_id.size());
+
+                    std::unordered_map<int,int> kept_id_depth;  // img_id -> chosen id after view-angle filtering
+                    std::vector<Eigen::Vector3d> kept_dirs;
+                    kept_id_depth.reserve(best_id.size());
+                    kept_obs_ids_depth.reserve(best_id.size());
+                    kept_dirs.reserve(best_id.size());
+
+                    for (auto &kv : best_id) {
+                        const int comp_idx = kv.second;
+                        const int cam_id = kv.first;
+                        if (cam_id < 0 || cam_id >= (int)Rcw_all_optimized_.size() ||
+                            cam_id >= (int)tcw_all_optimized_.size()) {
+                            continue;
+                        }
+                        const Eigen::Matrix3d& Rcw = Rcw_all_optimized_[cam_id];
+                        const Eigen::Vector3d& tcw = tcw_all_optimized_[cam_id];
+                        const Eigen::Vector3d Cw = -Rcw.transpose() * tcw;
+
+                        Eigen::Vector3d dir = points3d[comp_idx] - Cw;
+                        const double dir_norm = dir.norm();
+                        if (dir_norm < 1e-6) continue;
+                        dir /= dir_norm;
+
+                        double min_dot = 1.0;
+                        for (const auto& d : kept_dirs) {
+                            const double dot = dir.dot(d);
+                            if (dot < min_dot) min_dot = dot;
+                        }
+                        if (kept_dirs.empty() || min_dot <= cos_min_view_angle) {
+                            kept_id_depth[cam_id] = comp_idx;
+                            kept_obs_ids_depth.push_back(comp_idx);
+                            kept_dirs.push_back(dir);
+                        }
+                    }
+
+                    if ((int)kept_obs_ids_depth.size() >= obser_thr_) {
+                        depth_ok = ComputeMeanReproj(
+                            Xw_depth, kept_id_depth, component, all_keypoints_, Rcw_all_optimized_,
+                            tcw_all_optimized_, cam, obser_thr_,
+                            mean_reproj_depth, cnt_reproj_depth);
+                        depth_ok = depth_ok && (mean_reproj_depth <= reproj_mean_thr_px_);
+                    }
+                }
             }
 
-            Eigen::Vector3d anchor = points3d[idx_valid[0]];
-            
-            // 按距离挑 inliers（idx_valid 是 component 的下标子集）
-            std::vector<int> inliers;
-            inliers.reserve(idx_valid.size());
-            for (int id : idx_valid) {
-                double dist = (points3d[id] - anchor).norm();
-                if (dist < 0.12) inliers.push_back(id);  // 0.1 m
-            }
-            if ((int)inliers.size() < obser_thr_) {
-                for (auto &obs : component) obs_to_track[obs.first][obs.second] = -1;
-                continue;
+            // triangulation 候选：先三角化出 3D 点，再按原始代码风格做视角筛选。
+            if (unique_id.size() >= 4) {
+                ++tri_candidates;
+                const auto tri_start = std::chrono::steady_clock::now();
+                Eigen::Vector3d Xw_tri_seed = Eigen::Vector3d::Zero();
+                double mean_reproj_tri_seed = std::numeric_limits<double>::infinity();
+                int cnt_reproj_tri_seed = 0;
+                if (TriangulateTrackDLT(
+                        unique_id, component, all_keypoints_, Rcw_all_optimized_, tcw_all_optimized_,
+                        cam, Xw_tri_seed, mean_reproj_tri_seed, cnt_reproj_tri_seed)) {
+                    std::unordered_map<int,int> kept_id_tri;  // img_id -> chosen id after view-angle filtering
+                    std::vector<Eigen::Vector3d> kept_dirs;
+                    kept_id_tri.reserve(unique_id.size());
+                    kept_obs_ids_tri.reserve(unique_id.size());
+                    kept_dirs.reserve(unique_id.size());
+
+                    for (auto &kv : unique_id) {
+                        const int comp_idx = kv.second;
+                        const int cam_id = kv.first;
+                        if (cam_id < 0 || cam_id >= (int)Rcw_all_optimized_.size() ||
+                            cam_id >= (int)tcw_all_optimized_.size()) {
+                            continue;
+                        }
+                        const Eigen::Matrix3d& Rcw = Rcw_all_optimized_[cam_id];
+                        const Eigen::Vector3d& tcw = tcw_all_optimized_[cam_id];
+                        const Eigen::Vector3d Cw = -Rcw.transpose() * tcw;
+
+                        Eigen::Vector3d dir = Xw_tri_seed - Cw;
+                        const double dir_norm = dir.norm();
+                        if (dir_norm < 1e-6) continue;
+                        dir /= dir_norm;
+
+                        double min_dot = 1.0;
+                        for (const auto& d : kept_dirs) {
+                            const double dot = dir.dot(d);
+                            if (dot < min_dot) min_dot = dot;
+                        }
+                        if (kept_dirs.empty() || min_dot <= cos_min_view_angle) {
+                            kept_id_tri[cam_id] = comp_idx;
+                            kept_obs_ids_tri.push_back(comp_idx);
+                            kept_dirs.push_back(dir);
+                        }
+                    }
+
+                    if ((int)kept_obs_ids_tri.size() >= 4 &&
+                        TriangulateTrackDLT(
+                            kept_id_tri, component, all_keypoints_, Rcw_all_optimized_, tcw_all_optimized_,
+                            cam, Xw_tri, mean_reproj_tri, cnt_reproj_tri)) {
+                        ++tri_valid;
+                        tri_ok = mean_reproj_tri <= reproj_mean_thr_px_;
+                    }
+                }
+                tri_time_total_ms += std::chrono::steady_clock::now() - tri_start;
             }
 
-            // 按 image_id 去重，计算融合点（每图一票）
-            std::unordered_map<int,int> best_id;  // img_id -> chosen id
-            best_id.reserve(inliers.size());
-            for (int id : inliers) {
-                int img_id = component[id].first;
-                if (!best_id.count(img_id)) best_id[img_id] = id;
-            }
-            if ((int)best_id.size() < obser_thr_) {
-                for (auto &obs : component) obs_to_track[obs.first][obs.second] = -1;
-                continue;
-            }
-
-            // 融合并检测重投影误差
             Eigen::Vector3d Xw_fused = Eigen::Vector3d::Zero();
-            for (const auto& kv : best_id)
-            {
-                const int comp_idx = kv.second;
-                Xw_fused += points3d[comp_idx];
-            }
-            Xw_fused /= double(best_id.size());
-
-            if (Xw_fused.norm() < 0.1) {
-                std::cout << "bad fused point: " << Xw_fused.transpose() << std::endl;
-            }
-
-            // ---------- reprojection mean error gate (after Xw_fused) ----------
-            double sum_err = 0.0;
+            double mean_reproj = std::numeric_limits<double>::infinity();
             int cnt_err = 0;
-
-            for (const auto& kv : best_id) {
-                const int comp_idx = kv.second;
-                const int img_id = component[comp_idx].first;
-                const int kp_id  = component[comp_idx].second;
-
-                if (img_id < 0 || img_id >= (int)Rcw_all_optimized_.size() || img_id >= (int)tcw_all_optimized_.size()) continue;
-                if (img_id < 0 || img_id >= (int)all_keypoints_.size() || kp_id < 0 || kp_id >= (int)all_keypoints_[img_id].size()) continue;
-
-                const double u_obs = all_keypoints_[img_id][kp_id].x;
-                const double v_obs = all_keypoints_[img_id][kp_id].y;
-
-                const Eigen::Matrix3d& Rcw = Rcw_all_optimized_[img_id];
-                const Eigen::Vector3d& tcw = tcw_all_optimized_[img_id];
-                const Eigen::Vector3d Xc = Rcw * Xw_fused + tcw;
-                if (Xc.z() <= 1e-9) continue;
-
-                const double invz = 1.0 / Xc.z();
-                const double u_hat = fx_ * (Xc.x() * invz) + cx_;
-                const double v_hat = fy_ * (Xc.y() * invz) + cy_;
-
-                const double du = u_hat - u_obs;
-                const double dv = v_hat - v_obs;
-                const double err = std::sqrt(du * du + dv * dv);
-
-                sum_err += err;
-                cnt_err++;
-            }
-
-            if (cnt_err < obser_thr_) {
+            if (depth_ok && tri_ok) {
+                if (mean_reproj_tri < mean_reproj_depth) {
+                    Xw_fused = Xw_tri;
+                    mean_reproj = mean_reproj_tri;
+                    cnt_err = cnt_reproj_tri;
+                    kept_obs_ids = kept_obs_ids_tri;
+                    ++tri_selected;
+                } else {
+                    Xw_fused = Xw_depth;
+                    mean_reproj = mean_reproj_depth;
+                    cnt_err = cnt_reproj_depth;
+                    kept_obs_ids = kept_obs_ids_depth;
+                    ++depth_selected;
+                }
+            } else if (tri_ok) {
+                Xw_fused = Xw_tri;
+                mean_reproj = mean_reproj_tri;
+                cnt_err = cnt_reproj_tri;
+                kept_obs_ids = kept_obs_ids_tri;
+                ++tri_selected;
+            } else if (depth_ok) {
+                Xw_fused = Xw_depth;
+                mean_reproj = mean_reproj_depth;
+                cnt_err = cnt_reproj_depth;
+                kept_obs_ids = kept_obs_ids_depth;
+                ++depth_selected;
+            } else {
+                const double best_reproj = std::min(mean_reproj_depth, mean_reproj_tri);
+                if (std::isfinite(best_reproj)) {
+                    std::cout << "[TrackFilter] drop by mean reproj=" << best_reproj
+                              << " thr=" << reproj_mean_thr_px_ << std::endl;
+                }
                 for (auto &obs : component) obs_to_track[obs.first][obs.second] = -1;
                 continue;
             }
 
-            const double mean_reproj = sum_err / double(cnt_err);
-            if (mean_reproj > reproj_mean_thr_px_) {
-
-                std::cout << "[TrackFilter] drop by mean reproj=" << mean_reproj
-                          << " thr=" << reproj_mean_thr_px_ << " cnt=" << cnt_err << std::endl;
-
+            if (!Xw_fused.allFinite() || Xw_fused.isZero(1e-12)) {
                 for (auto &obs : component) obs_to_track[obs.first][obs.second] = -1;
                 continue;
             }
-
-            const double cos_min_view_angle = std::cos(min_view_angle_deg_ * M_PI / 180.0);
-
-            std::vector<int> kept_obs_ids;
-            std::vector<Eigen::Vector3d> kept_dirs;
-            kept_obs_ids.reserve(best_id.size());
-            kept_dirs.reserve(best_id.size());
-
-            for (auto &kv : best_id) {
-                const int comp_idx = kv.second;
-                const int cam_id = kv.first;
-                if (cam_id < 0 || cam_id >= (int)Rcw_all_optimized_.size() ||
-                    cam_id >= (int)tcw_all_optimized_.size()) {
-                    continue;
-                }
-                const Eigen::Matrix3d& Rcw = Rcw_all_optimized_[cam_id];
-                const Eigen::Vector3d& tcw = tcw_all_optimized_[cam_id];
-                const Eigen::Vector3d Cw = -Rcw.transpose() * tcw;
-
-                Eigen::Vector3d dir = points3d[comp_idx] - Cw;
-                const double dir_norm = dir.norm();
-                if (dir_norm < 1e-6) continue;
-                dir /= dir_norm;
-
-                double min_dot = 1.0;
-                for (const auto& d : kept_dirs) {
-                    const double dot = dir.dot(d);
-                    if (dot < min_dot) min_dot = dot;
-                }
-                if (kept_dirs.empty() || min_dot <= cos_min_view_angle) {
-                    kept_obs_ids.push_back(comp_idx);
-                    kept_dirs.push_back(dir);
-                }
-            }
-
-            // auto log_track_stats = [&](const char* tag) {
-            //     static int dbg_cnt = 0;
-            //     if (dbg_cnt < 10 || (dbg_cnt % 200 == 0)) {
-            //         std::cout << "[TrackFilter] " << tag
-            //                   << " comp=" << component.size()
-            //                   << " inliers=" << inliers.size()
-            //                   << " best=" << best_id.size()
-            //                   << " kept=" << kept_obs_ids.size()
-            //                   << std::endl;
-            //     }
-            //     ++dbg_cnt;
-            // };
-
-            if (kept_obs_ids.empty() || (int)kept_obs_ids.size() < obser_thr_) {
-                // log_track_stats("drop");
-                for (auto &obs : component) obs_to_track[obs.first][obs.second] = -1;
-                continue;
-            }
-            // log_track_stats("keep");
 
             // Eigen::Vector3d Xw_fused = Eigen::Vector3d::Zero();
             // for (int id : kept_obs_ids) Xw_fused += points3d[id];
@@ -1091,8 +1247,14 @@ void LvbaSystem::BuildTracksAndFuse3D() {
         const double keep_ratio = 100.0 * static_cast<double>(kept) / static_cast<double>(total_components);
         std::cout << "[TrackFilter] kept=" << kept << " dropped=" << dropped
                   << " total=" << total_components
+                  << " depth_selected=" << depth_selected
+                  << " tri_selected=" << tri_selected
                   << " ratio=" << std::fixed << std::setprecision(2)
                   << keep_ratio << "%" << std::defaultfloat << std::endl;
+        std::cout << "[TriangulationCPU] candidates=" << tri_candidates
+                  << " valid=" << tri_valid
+                  << " selected=" << tri_selected
+                  << " time_ms=" << tri_time_total_ms.count() << std::endl;
     }
     tracks_before_ = tracks_;
 
@@ -1510,6 +1672,7 @@ void LvbaSystem::optimizeCameraPoses()
 void LvbaSystem::visualizeProj() {
 
     namespace fs = std::filesystem;
+    const CameraIntrinsics cam{fx_, fy_, cx_, cy_, d0_, d1_, d2_, d3_};
 
     // ------- 小工具（lambda） -------
     auto drawCross = [](cv::Mat& img, const cv::Point2d& p, int size, int thickness, const cv::Scalar& color) {
@@ -1519,28 +1682,6 @@ void LvbaSystem::visualizeProj() {
     auto putTextShadow = [](cv::Mat& img, const std::string& text, cv::Point org, double scale=0.45, int thick=1, cv::Scalar color=CV_RGB(0,0,0)) {
         // cv::putText(img, text, org + cv::Point(1,1), cv::FONT_HERSHEY_SIMPLEX, scale, CV_RGB(0,0,0), thick+2, cv::LINE_AA);
         cv::putText(img, text, org, cv::FONT_HERSHEY_SIMPLEX, scale, color, thick, cv::LINE_AA);
-    };
-    auto projectWithDistortion = [&](const Eigen::Vector3d& Pw,
-                                     const Eigen::Matrix3d& Rcw,
-                                     const Eigen::Vector3d& tcw,
-                                     cv::Point2d& uv_out) -> bool {
-        const Eigen::Vector3d Pc = Rcw * Pw + tcw;
-        const double X = Pc.x(), Y = Pc.y(), Z = Pc.z();
-        if (!(Z > 1e-12) || !std::isfinite(X) || !std::isfinite(Y) || !std::isfinite(Z)) return false;
-                                
-        const double x = X / Z, y = Y / Z;
-        const double r2 = x*x + y*y, r4 = r2*r2;
-        const double radial = 1.0 + d0_ * r2 + d1_ * r4;
-        const double x_t = 2.0*d2_*x*y + d3_*(r2 + 2.0*x*x);
-        const double y_t = d2_*(r2 + 2.0*y*y) + 2.0*d3_*x*y;
-        const double xd = x*radial + x_t;
-        const double yd = y*radial + y_t;
-
-        const double u = fx_ * xd + cx_;
-        const double v = fy_ * yd + cy_;
-        if (!std::isfinite(u) || !std::isfinite(v)) return false;
-        uv_out = cv::Point2d(u, v);
-        return true;
     };
 
     // ------- 基本检查 -------
@@ -1603,10 +1744,16 @@ void LvbaSystem::visualizeProj() {
 
             // pre
             cv::Point2d uv_pre;
-            bool ok_pre = projectWithDistortion(Pw_pre, Rcw_all_[cam_id], tcw_all_[cam_id], uv_pre);
+            double u_pre = 0.0, v_pre = 0.0;
+            bool ok_pre = projectWorldToPixel(cam, Rcw_all_[cam_id], tcw_all_[cam_id],
+                                              Pw_pre, &u_pre, &v_pre);
+            uv_pre = cv::Point2d(u_pre, v_pre);
             // post
             cv::Point2d uv_post;
-            bool ok_post = projectWithDistortion(Pw_post, Rcw_all_optimized_[cam_id], tcw_all_optimized_[cam_id], uv_post);
+            double u_post = 0.0, v_post = 0.0;
+            bool ok_post = projectWorldToPixel(cam, Rcw_all_optimized_[cam_id], tcw_all_optimized_[cam_id],
+                                               Pw_post, &u_post, &v_post);
+            uv_post = cv::Point2d(u_post, v_post);
 
             Item it;
             it.uv_meas = uv_meas;
@@ -1686,8 +1833,7 @@ void LvbaSystem::visualizeProj() {
     std::cout << "[visualizeProj] global mean post: " << global_err_post << "\n";
 
     std::cout << "[visualizeProj] done. saved to: " << out_dir << std::endl;
-    std::string dir = dataset_path_ + "Colmap/colored_merged.pcd";
-    VisualizeOptComparison(images_ids_, true, dir);
+    VisualizeOptComparison(images_ids_, true);
 }
 
 void LvbaSystem::showTracksComparePCL() 
@@ -1778,42 +1924,14 @@ bool LvbaSystem::ProjectToImage(
     const Eigen::Vector3d& Xw,
     double* u, double* v, double* Zc) const
 {
-    const Eigen::Vector3d Xc = Rcw * Xw + tcw;
-    const double z = Xc.z();
-    if (Zc) *Zc = z;
-    if (z <= 1e-6) return false;
-
-    const double xn = Xc.x() / z;
-    const double yn = Xc.y() / z;
-
-    // Brown-Conrady: k1,k2,p1,p2
-    const double k1 = d0_, k2 = d1_, p1 = d2_, p2 = d3_;
-    const double r2  = xn*xn + yn*yn;
-    const double r4  = r2 * r2;
-    const double radial = 1.0 + k1 * r2 + k2 * r4;
-
-    // 切向
-    const double x_tan = 2.0 * p1 * xn * yn + p2 * (r2 + 2.0 * xn * xn);
-    const double y_tan = p1 * (r2 + 2.0 * yn * yn) + 2.0 * p2 * xn * yn;
-
-    // 畸变后归一化坐标
-    const double xdist = xn * radial + x_tan;
-    const double ydist = yn * radial + y_tan;
-
-    // 像素坐标
-    const double uu = fx_ * xdist + cx_;
-    const double vv = fy_ * ydist + cy_;
-
-    if (u) *u = uu;
-    if (v) *v = vv;
-    return std::isfinite(uu) && std::isfinite(vv);
+    const CameraIntrinsics cam{fx_, fy_, cx_, cy_, d0_, d1_, d2_, d3_};
+    return projectWorldToPixel(cam, Rcw, tcw, Xw, u, v, Zc);
 }
 
 
 void LvbaSystem::VisualizeOptComparison(
     const std::vector<double>& image_ids,
-    bool save_merged_pcd,
-    const std::string& merged_pcd_path)
+    bool save_merged_pcd)
 {
     const auto& pl_fulls = dataset_io_->pl_fulls_;
     const auto& x_buf_opt = dataset_io_->x_buf_;
@@ -1990,10 +2108,18 @@ void LvbaSystem::VisualizeOptComparison(
 
     if(colmap_output_enable_)
     {
+        const std::string after_path = dataset_path_ + "Colmap/colored_merged_after.pcd";
+        const std::string before_path = dataset_path_ + "Colmap/colored_merged_before.pcd";
+
         std::cout << "[Colorize] Merged colored cloud size = " << merged->size() << "\n";
         down_sampling_voxel2(*merged, filter_size_points3D_);
-        pcl::io::savePCDFileBinary(merged_pcd_path, *merged);
+        pcl::io::savePCDFileBinary(after_path, *merged);
         std::cout << "[Colorize] Downsampled size = " << merged->size() << "\n";
+
+        std::cout << "[Colorize] Merged colored cloud before size = " << merged_b->size() << "\n";
+        down_sampling_voxel2(*merged_b, filter_size_points3D_);
+        pcl::io::savePCDFileBinary(before_path, *merged_b);
+        std::cout << "[Colorize] Downsampled before size = " << merged_b->size() << "\n";
 
         std::string sparse_dir = dataset_path_ + "Colmap/sparse/";
         if (!fs::exists(sparse_dir)) fs::create_directories(sparse_dir);

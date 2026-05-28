@@ -70,8 +70,7 @@ public:
 
     void VisualizeOptComparison(
             const std::vector<double>& image_ids,
-            bool save_merged_pcd,
-            const std::string& merged_pcd_path);
+            bool save_merged_pcd);
 
     void visialTrackCloud();
 
