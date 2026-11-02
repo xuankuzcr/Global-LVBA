@@ -1576,7 +1576,8 @@ void LvbaSystem::optimizeCameraPoses()
     options.minimizer_progress_to_stdout = true;
 
     for (int k = 0; k < M; ++k) {
-        problem.AddParameterBlock(qs[k].data(), 4, new ceres::EigenQuaternionManifold());
+        // qs stores quaternion coefficients in Ceres' [w, x, y, z] order.
+        problem.AddParameterBlock(qs[k].data(), 4, new ceres::QuaternionManifold());
         problem.AddParameterBlock(ts[k].data(), 3);
     }
     problem.SetParameterBlockConstant(qs[0].data());
